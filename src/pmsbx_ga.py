@@ -1,240 +1,237 @@
+from utils import *
 import datetime
-import copy
-import pandas as pd
-import random
-
-from src.chromosome import *
-from src.conditions_pmsbx_ga import cal_fitness_value
+from collections import defaultdict
+import numpy as np
 
 
-"""Create population function - PMSBX-GA"""
+def hard_constraint_1(chromosome):
+    HC1_count = 0
+    BATDAY = dict()
+    for gen in chromosome:
+        # gen_parser = "id","start_date","end_date","scheduled_date","routine","battery_type","num_battery"
+        gen_parser = parser_gen_pmsbx(gen)
+        ###Decode Setup###
+        battery_type = access_row_by_wonum(gen_parser.id)["battery_type"]
+        battery_type_list = battery_type.split("|")
+        check_battery_type = (
+            battery_type_dec_convert[gen_parser.battery_type] in battery_type_list
+        )
+        # Kiểm tra battery_type của gene hiện tại có nằm trong danh sách của battery_type của id đó trong file data không
+        if check_battery_type == False:
+            HC1_count += 1
+            continue
+        device = access_row_by_wonum(gen_parser.id)["device_type"]
+        tup_temp = (
+            battery_type_dec_convert[gen_parser.battery_type],
+            gen_parser.scheduled_date,
+            device,
+        )
+        BATDAY[tup_temp] = BATDAY.get(tup_temp, 0) + 0.5
 
-def _generate_parent(df):
-    genes = []
-    for supply_id, start_day, end_date, battery_type, d_estdur in zip(
-        df.supply_id,
-        df.start_day,
-        df.end_date,
-        df.battery_type,
-        df.d_estdur
-    ):
-        i = 0.5
-        while(i <= d_estdur):
-            rand_date = random_datetime(start_day, end_date)
-            routine = random.choice([0, 1])
-            battery_type_list = battery_type.split("|")
-            battery_type_gen = random.choice(battery_type_list)
-            battery_type_gen = battery_type_dec[battery_type_gen]
+    for key, value in BATDAY.items():
+        bat_type, date, device = key
+        data_resource_value = get_resource(bat_type, date, device)
+        # Chuyen value (đang đơn vị là day) thành ngày theo công thức 1 day = 10KAh
+        value_KAh = value * 10
+        if data_resource_value == -1:  # gen date with date not in resouce
+            HC1_count += 1
+        elif data_resource_value < value_KAh:
+            HC1_count += 1
+    return HC1_count
 
-            num_battery = random.randint(0, 10)
-            decstring = "-".join(
-                [rand_date, str(routine), str(battery_type_gen), str(num_battery)]
+
+def hard_constraint_2(chromosome):
+    # Ở một thời điểm, mỗi thiết bị chỉ được cung cấp năng lượng bởi 1 pin mà thôi
+    # (không có 2 pin cùng cung cấp năng lượng cho 1 máy)
+    HC2_count = 0
+    parsed_genes = [parser_gen_pmsbx(gene) for gene in chromosome]
+    device_types = {
+        gene.id: access_row_by_wonum(gene.id)["device_type"] for gene in parsed_genes
+    }
+
+    num_genes = len(parsed_genes)
+
+    for i in range(num_genes):
+        for j in range(i + 1, num_genes):
+            gen_parser = parsed_genes[i]
+            temporary_gene_parser = parsed_genes[j]
+
+            if (
+                gen_parser.scheduled_date == temporary_gene_parser.scheduled_date
+                and gen_parser.routine == temporary_gene_parser.routine
+                and device_types[gen_parser.id]
+                == device_types[temporary_gene_parser.id]
+                and gen_parser.battery_type != temporary_gene_parser.battery_type
+            ):
+                HC2_count += 1
+
+    return HC2_count
+
+
+def hard_constraint_3(chromosome):
+    # Ở một thời điểm, một pin không cung cấp năng lượng cho 2 thiết bị khác nhau.
+    HC3_count = 0
+    parsed_genes = [parser_gen_pmsbx(gene) for gene in chromosome]
+    device_types = {
+        gene.id: access_row_by_wonum(gene.id)["device_type"] for gene in parsed_genes
+    }
+
+    num_genes = len(parsed_genes)
+
+    for i in range(num_genes):
+        for j in range(i + 1, num_genes):
+            gen_parser = parsed_genes[i]
+            temporary_gene_parser = parsed_genes[j]
+
+            if (
+                gen_parser.scheduled_date == temporary_gene_parser.scheduled_date
+                and gen_parser.routine == temporary_gene_parser.routine
+                and device_types[gen_parser.id]
+                != device_types[temporary_gene_parser.id]
+                and gen_parser.battery_type == temporary_gene_parser.battery_type
+            ):
+                HC3_count += 1
+
+    return HC3_count
+
+
+def soft_constraint_1(chromosome):
+    # The scheduled date of a request s_i should happen closely to
+    # the time that the request s_i−1 before it occurs, or f_diff(si, ei) − f_diff(si−1, ei−1) → 0.
+    SC_count = 0
+    for index, current_gene in enumerate(chromosome):
+        if index == 0:
+            continue
+        # gen_parser = "id","start_date","end_date","scheduled_date","routine","battery_type","num_battery"
+        gene_parser = parser_gen_pmsbx(current_gene)
+        gene_before_parser = parser_gen_pmsbx(chromosome[index - 1])
+        diff_date = difference_date(
+            gene_parser.scheduled_date, gene_before_parser.scheduled_date
+        )
+        date_count = abs(diff_date.days)
+        # date_count là khoảng cách của số ngày thứ i và số ngày thứ i-1.
+        # Theo yêu cầu soft constraint 1 trong bài báo thì
+        # 2 ngày thứ i và số ngày thứ i-1 càng gần nhau càng tốt
+        SC_count = date_count + SC_count
+    return SC_count
+
+
+def soft_constraint_2(chromosome):
+    # Execution time should be minimized f_diff(si, ei) → 0.
+    return 0
+
+
+def soft_constraint_3(chromosome):
+    # Việc cung cấp năng lượng nên được thực hiện liên tục, không ngắt
+    # quãng hoặc thời gian (duration) để thực hiện công việc này không
+    # nên quá dài (càng ngắn càng tốt)
+
+    # Bước 1. Duyệt gene trong chromosome
+    # Bước 2. Tạo mảng và thêm các ngày có cùng Supply_ID vào mảng đó
+    # (Mục đích là để so sánh khoảng cách của các ngày thực thi trong cùng Supply_ID)
+    # Bước 3. Sắp xếp theo thứ tự ngày tăng dần
+    # Bước 4. Tính khoảng cách của các ngày trong cùng ID đó. Nếu khoảng cách lớn hơn 2
+    # thì tăng SC_count lên 1
+
+    # Lưu số đếm cho SC, trong trường hợp số ngày của các gene có trong cùng 1 ID mà có khoảng cách lớn hơn 2
+    # thì tăng SC_count lên 1
+    SC_count = 0
+    list_date_same_ID = []
+    # 1. Duyệt gene trong chromosome
+    for index in range(len(chromosome) - 1):
+        # gen_parser = "id","start_date","end_date","scheduled_date","routine","battery_type","num_battery"
+        gene_parser = parser_gen_pmsbx(chromosome[index])
+        gene_after_parser = parser_gen_pmsbx(chromosome[index + 1])
+        if gene_parser.id == gene_after_parser.id:
+            scheduled_date = datetime.datetime.strptime(
+                gene_parser.scheduled_date, date_format
             )
-            chromosome = "-".join([supply_id, start_day, end_date, decstring])
-            genes.append(chromosome)
-            i = i + 0.5
-    return genes
+            list_date_same_ID.append(scheduled_date)
+        else:
+            sorted_dates = sorted(list_date_same_ID)
+            for i in range(len(sorted_dates) - 1):
+                diff_date = sorted_dates[i + 1] - sorted_dates[i]
+                date_count = abs(diff_date.days)
+                if date_count > 2:
+                    SC_count = date_count + SC_count
+            list_date_same_ID.clear()
 
-def init_population(size_of_population):
-    population = []
-    for i in range(size_of_population):
-        # individual = CHROMOSOME_PMSBX_GA(get_data())
-        individual = _generate_parent(get_data())
-        population.append(individual)
-    population = np.asarray(population)
-    return population
+    return SC_count
 
 
-"""Select a sub-population for offspring production - PMSBX-GA"""
+def manday_chromosome(chromosome):
+    HC_count = 0
+    dealine_count = 0
+    result = 0
+    BATDAY = defaultdict(float)
 
+    for gen in chromosome:
+        gen_parser = parser_gen_pmsbx(gen)
+        d_estdur = access_row_by_wonum(gen_parser.id)["d_estdur"]
+        device = access_row_by_wonum(gen_parser.id)["device_type"]
+        dealine = access_row_by_wonum(gen_parser.id)["end_date"]
+        date_dealine = datetime.datetime.strptime(dealine, "%d/%m/%Y")
+        date_begin = datetime.datetime.strptime(gen_parser.scheduled_date, "%d/%m/%Y")
 
-def select_mating_pool(pop, num_parents_mating):
-    # shuffling the pop then select top of pops
-    pop = np.asarray(pop)
-    index = np.random.choice(pop.shape[0], num_parents_mating, replace=False)
-    random_individual = pop[index]
-    # split current pop into remain_pop and mating_pool
-    # pop = np.delete(pop, index)
-    return random_individual
-
-
-"""Crossover - PMSBX-GA"""
-
-
-def crossover(parents, distribution_index):
-    offspring = []
-
-    for k in range(0, parents.shape[0], 2):
-        # Index of the first parent to mate.
-        parent1_idx = k % parents.shape[0]
-        # Index of the second parent to mate.
-        if k + 1 >= len(parents):
-            break
-        parent2_idx = (k + 1) % parents.shape[0]
-        parent1 = parents[parent1_idx]
-        parent2 = parents[parent2_idx]
-        chromosome_1 = parent1
-        chromosome_2 = parent2
-        offspring_1 = []
-        offspring_2 = []
-        for task1, task2 in zip(chromosome_1, chromosome_2):
-            gen_1 = parser_gen_pmsbx(task1)
-            gen_2 = parser_gen_pmsbx(task2)
-            new_gen_1, new_gen_2 = crossover_calculation(
-                gen_1, gen_2, distribution_index
+        num_date = round(d_estdur)
+        check_dealine = date_begin + datetime.timedelta(days=num_date)
+        if date_dealine < check_dealine:
+            dealine_count += 1
+        for i in range(int(d_estdur * 2)):  # Loop over half days
+            num_date = i / 2
+            run_date = date_begin + datetime.timedelta(days=num_date)
+            tup_temp = (
+                battery_type_dec_convert[gen_parser.battery_type],
+                run_date.strftime("%d/%m/%Y"),
+                device,
             )
-            new_gen_1_string = convert_to_string_format(new_gen_1, gen_1)
-            new_gen_2_string = convert_to_string_format(new_gen_2, gen_2)
-            offspring_1.append(new_gen_1_string)
-            offspring_2.append(new_gen_2_string)
+            BATDAY[tup_temp] += 0.5
 
-        offspring.append(offspring_1)
-        offspring.append(offspring_2)
-    return np.array(offspring)
+    for key, value in BATDAY.items():
+        bat_type, date, device = key
+        data_resource_value = get_resource(bat_type, date, device)
+        # data_resource_value = data_resource_value * 1.25
+        value_KAh = value * 5
+
+        if data_resource_value == -1 or data_resource_value < value_KAh:
+            HC_count += 1
+
+    result = HC_count + dealine_count * 5
+
+    return result
 
 
-"""Mutation - PMSBX-GA"""
+def cal_fitness_value_full_constraint(population, HC_penalt_point, SC_penalt_point):
+    fitness = []
+    SC_count = 0
 
-def mutation(offspring, distribution_index):
-    new_offspring = []
-    for index in range(len(offspring)):
-        chromosome = offspring[index]
-        offspring_temp = []
-        for index_gene in range(len(chromosome)):
-            gene = parser_gen_pmsbx(chromosome[index_gene])
-            vector = mutation_calculation(gene, distribution_index)
-            new_gene_string = convert_to_string_format(vector,gene)
-            offspring_temp.append(new_gene_string)
-        new_offspring.append(offspring_temp)
-    return np.array(new_offspring)
+    for index in range(len(population)):
+        HC_count = 0
+        SC_count = 0
+        chromosome = population[index]
+        HC_count_1 = hard_constraint_1(chromosome)
+        HC_count_2 = hard_constraint_2(chromosome)
+        HC_count_3 = hard_constraint_3(chromosome)
+        HC_count = HC_count_1 + HC_count_2 + HC_count_3
 
-def convert_to_string_format(vector, gene):
-    # gene(id, start_date, end_date, scheduled_date, routine, battery_type, num_battery)
-    # v = (routine,(scheduled_date − start_date), battery_type, num_battery)
-    start_date = datetime.datetime.strptime(gene.start_date, date_format)
-    scheduled_date = datetime.timedelta(days=vector.difference_date) + start_date
-    scheduled_date_string = scheduled_date.strftime(date_format)
-
-    decstring = "-".join([scheduled_date_string, str(vector.routine), str(vector.battery_type), str(vector.num_battery)])
-    new_gene = "-".join([gene.id, gene.start_date, gene.end_date, decstring])
-    return new_gene
-
-def crossover_calculation(gen_1, gen_2, distribution_index):
-    # Khoi tao bien group selected variables
-    # Gen_structure = (id, start_date, end_date, scheduled_date, routine, battery_type, num_battery)
-    # v = (routine,(scheduled_date − start_date), battery_type, num_battery)
-    beta_para = 0
-
-    diff_date_gen_1 = difference_date(gen_1.scheduled_date, gen_1.start_date)
-    diff_date_gen_2 = difference_date(gen_1.scheduled_date, gen_1.start_date)
-
-    candidate_1 = (0, 0, 0, 0)
-    candidate_2 = (0, 0, 0, 0)
-
-    check = False
-    while check == False:
-        random_rate = generate_random_number()
-        if random_rate <= 0.5:
-            beta_para = power_of_fraction(2 * random_rate, 1, distribution_index + 1)
-        elif random_rate > 0.5:
-            beta_para = power_of_fraction(
-                (2 - 2 * random_rate), 1, distribution_index + 1
-            )
-
-        vector_v1 = (
-            int(gen_1.routine),
-            diff_date_gen_1.days,
-            int(gen_1.battery_type),
-            int(gen_1.num_battery),
+        SC_count_1 = soft_constraint_1(chromosome)
+        SC_count_2 = soft_constraint_2(chromosome)
+        SC_count_3 = soft_constraint_3(chromosome)
+        SC_count = SC_count_1 + SC_count_2 + SC_count_3
+        fitness_value = 1 / (
+            HC_count * HC_penalt_point + SC_count * SC_penalt_point + 1
         )
-        vector_v2 = (
-            int(gen_2.routine),
-            diff_date_gen_2.days,
-            int(gen_2.battery_type),
-            int(gen_2.num_battery),
-        )
+        fitness.append(fitness_value)
 
-        # v1_new = 0.5 × [(1 + β)υ1 + (1 − β)υ2]
-        candidate_1 = scalar_multiply_v1_crossover(beta_para, vector_v1, vector_v2)
-        # v2_new = 0.5 × [(1 - β)υ1 + (1 + β)υ2]
-        candidate_2 = scalar_multiply_v2_crossover(beta_para, vector_v1, vector_v2)
-
-        # Check for violations of each variable in v_1 and v_2
-        check = check_violations(candidate_1, candidate_2)
-    return candidate_1, candidate_2
+    fitness = np.asarray(fitness)
+    return fitness
 
 
-def check_violations(candidate_1, candidate_2):
-    # ['routine', 'difference_date', 'battery_type', 'num_battery']
+def cal_fitness_value(population, HC_penalt_point, SC_penalt_point):
+    fitness = np.empty(len(population), dtype=float)
+    for index, chromosome in enumerate(population):
+        HC_count = manday_chromosome(chromosome)
+        fitness_value = 1 / (HC_count + 1)
+        fitness[index] = fitness_value
 
-    # check  routine ∈ {0, 1} is the ROUTINE variable.
-    if candidate_1.routine <= 0 and candidate_1.routine >= 1:
-        return False
-    if candidate_2.routine <= 0 and candidate_2.routine >= 1:
-        return False
-
-    # difference_date ∈ [0..30] is the difference between SCHEDULED DATE and the START DATE.
-    if candidate_1.difference_date <= 0 and candidate_1.difference_date >= 30:
-        return False
-    if candidate_2.difference_date <= 0 and candidate_2.difference_date >= 30:
-        return False
-
-    # battery_type ∈ [1..5] is the BATTERY TYPE variable
-    if candidate_1.battery_type <= 1 and candidate_1.battery_type >= 5:
-        return False
-    if candidate_2.battery_type <= 1 and candidate_2.battery_type >= 5:
-        return False
-
-    # num_battery ∈ [1..10] is the NUMBER OF BATTERIES variable
-    if candidate_1.num_battery <= 1 and candidate_1.num_battery >= 10:
-        return False
-    if candidate_2.num_battery <= 1 and candidate_2.num_battery >= 10:
-        return False
-    return True
-
-
-def mutation_calculation(gene, distribution_index):
-    # Khoi tao bien group selected variables
-    # v = (routine,(scheduled_date − start_date), battery_type, num_battery)
-    diff_date_gen_1 = difference_date(gene.scheduled_date, gene.start_date)
-    vector = (
-        int(gene.routine),
-        diff_date_gen_1.days,
-        int(gene.battery_type),
-        int(gene.num_battery),
-        )
-    delta_para = 0
-    new_gen = (0, 0, 0, 0)
-    # Generate a random number ε ∈ R, where 0 ≤ ε ≤ 1
-    random_rate = generate_random_number()
-    if random_rate <= 0.5:
-        delta_para = power_of_fraction(2 * random_rate, 1, distribution_index + 1) - 1
-    else:
-        delta_para = 1 - power_of_fraction(
-            (2 - 2 * random_rate), 1, distribution_index + 1
-        )
-    # temp = Vector(*parents)
-    # vector = (temp.routine, temp.difference_date, temp.battery_type, temp.num_battery)
-
-    new_gen = scalar_multiply_motation(vector, delta_para, random_rate)
-    return new_gen
-
-
-"""Selecting a new population for the next generation from parents and offsprings - PMSBX-GA"""
-
-
-def selection(parents, offsprings, HC_penalt_point, SC_penalt_point):  # num individual = num parents
-    # Combine parents and offsprings
-    parents = np.asarray(parents)
-    population = np.concatenate((parents, offsprings), axis=0)
-
-    # Calculate fitness for each individual in the population
-    fitness_array = cal_fitness_value(population, HC_penalt_point, SC_penalt_point)
-
-    # Select the best individuals for the next generation
-    num_parents = parents.shape[0]  # parents.shape[0] = num_parents_mating
-    new_population = population[
-        fitness_array.argsort()[-num_parents:]
-    ]  # first n-largest fitness
-
-    return new_population
+    return fitness
